@@ -17,7 +17,7 @@ FROM golang:${GO_VERSION}
 COPY --from=resources /usr/local /usr
 
 ARG PROTOC_GEN_GO_VERSION=
-RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@${PROTOC_GEN_GO_VERSION}
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v${PROTOC_GEN_GO_VERSION}
 ARG TTRPC_VERSION=
-RUN go install github.com/containerd/ttrpc/cmd/protoc-gen-go-ttrpc@${TTRPC_VERSION}
-RUN go install github.com/containerd/ttrpc/cmd/protoc-gen-gogottrpc@${TTRPC_VERSION}
+RUN go install github.com/containerd/ttrpc/cmd/protoc-gen-go-ttrpc@v${TTRPC_VERSION}
+RUN go install github.com/containerd/ttrpc/cmd/protoc-gen-gogottrpc@v${TTRPC_VERSION}
