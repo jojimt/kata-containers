@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error as _;
 use std::process;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use cgroups::manager::is_systemd_cgroup;
@@ -25,6 +25,11 @@ use crate::cgroups::CgroupConfig;
 use crate::ResourceUpdateOp;
 
 pub type CgroupManager = Box<dyn Manager>;
+
+/// How long to wait for the systemd driver to act on a queued placement
+/// before carrying on without confirmation.
+const PLACEMENT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const PLACEMENT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 pub(crate) struct CgroupsResourceInner {
     /// Container resources, key is container id, and value is resources.
@@ -72,36 +77,87 @@ impl CgroupsResourceInner {
         }
     }
 
-    /// Synchronously write the runtime's own pid into the sandbox cgroup's
-    /// `cgroup.procs` (cgroup v2 only; a no-op otherwise).
+    /// Add a process to a cgroup and do not return before the placement is
+    /// in effect.
     ///
-    /// `add_proc` already places the runtime, but on the systemd driver that
-    /// is an asynchronous call: the runtime may fork virtiofsd and the
-    /// VMM before systemd has moved it, so those children inherit its original
-    /// cgroup (e.g. `system.slice/containerd.service`). Under cgroup v2
-    /// first-touch accounting the guest RAM is then charged there, not to the
-    /// pod. A direct write is synchronous, so children forked afterwards
-    /// inherit the sandbox cgroup.
-    fn place_runtime_in_sandbox_cgroup_v2_sync(cgroup: &CgroupManager) -> Result<()> {
+    /// `add_proc` alone is not enough on the systemd driver, where it only
+    /// queues a DBus job: the runtime may fork virtiofsd and the VMM before
+    /// systemd has moved it, so those children inherit its original cgroup
+    /// (e.g. `system.slice/containerd.service`). Under cgroup v2 first-touch
+    /// accounting the guest RAM is then charged there, not to the pod.
+    fn place_proc_sync(cgroup: &mut CgroupManager, pid: u32, context: &str) -> Result<()> {
+        Self::add_proc_with_existing_retry(cgroup, CgroupPid::from(pid as u64), context)?;
+
+        if cgroup.v2() {
+            Self::write_proc_v2_sync(cgroup, pid)
+                .with_context(|| format!("{context} (synchronous cgroup.procs write)"))?;
+        } else {
+            Self::wait_proc_joined(cgroup, pid);
+        }
+
+        Ok(())
+    }
+
+    /// Write `pid` into the cgroup's `cgroup.procs` (cgroup v2 only; a no-op
+    /// otherwise). A direct write is synchronous, so children forked
+    /// afterwards inherit the cgroup.
+    fn write_proc_v2_sync(cgroup: &CgroupManager, pid: u32) -> Result<()> {
         if !cgroup.v2() {
             return Ok(());
         }
         let dir = cgroup
             .cgroup_path(None)
-            .context("resolve sandbox cgroup path for runtime placement")?;
+            .context("resolve cgroup path for process placement")?;
         let procs_path = format!("{}/cgroup.procs", dir.trim_end_matches('/'));
-        let pid = process::id();
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .open(&procs_path)
-            .with_context(|| format!("open sandbox cgroup.procs {procs_path}"))?;
+            .with_context(|| format!("open cgroup.procs {procs_path}"))?;
         std::io::Write::write_all(&mut file, format!("{pid}\n").as_bytes())
-            .with_context(|| format!("move runtime pid {pid} into sandbox cgroup {procs_path}"))?;
+            .with_context(|| format!("move pid {pid} into cgroup {procs_path}"))?;
         info!(
             sl!(),
-            "synchronously placed runtime (pid {}) into sandbox cgroup: {}", pid, procs_path
+            "synchronously placed pid {} into cgroup: {}", pid, procs_path
         );
         Ok(())
+    }
+
+    /// Wait for `pid` to show up in the cgroup.
+    ///
+    /// This is the only synchronization available under cgroup v1, where the
+    /// per-controller paths of the target cgroup cannot be derived from the
+    /// manager, so the direct `cgroup.procs` write is not an option.
+    /// Placement through cgroupfs is already effective when `add_proc`
+    /// returns, so only the systemd driver needs waiting for.
+    ///
+    /// Failing to confirm the placement is not fatal: the membership check
+    /// depends on the target cgroup being readable, and the VMM is placed in
+    /// the sandbox cgroup explicitly once it is running anyway.
+    fn wait_proc_joined(cgroup: &CgroupManager, pid: u32) {
+        if !cgroup.systemd() {
+            return;
+        }
+
+        let deadline = Instant::now() + PLACEMENT_WAIT_TIMEOUT;
+        loop {
+            let joined = cgroup
+                .pids()
+                .map(|pids| pids.iter().any(|p| p.pid == pid as u64))
+                .unwrap_or(false);
+            if joined {
+                return;
+            }
+            if Instant::now() >= deadline {
+                warn!(
+                    sl!(),
+                    "pid {} not visible in cgroup after {:?}, systemd may not have moved it yet",
+                    pid,
+                    PLACEMENT_WAIT_TIMEOUT
+                );
+                return;
+            }
+            std::thread::sleep(PLACEMENT_POLL_INTERVAL);
+        }
     }
 
     /// Create cgroup managers according to the cgroup configuration.
@@ -151,23 +207,13 @@ impl CgroupsResourceInner {
             Self::new_cgroup_managers(config).context("create new cgroups")?;
 
         // The runtime is prioritized to be added to the overhead cgroup.
-        let pid = CgroupPid::from(process::id() as u64);
+        // Either way the placement has to be in effect before the runtime
+        // forks virtiofsd and the VMM, as those inherit its cgroup.
+        let pid = process::id();
         if let Some(overhead_cgroup) = overhead_cgroup.as_mut() {
-            Self::add_proc_with_existing_retry(
-                overhead_cgroup,
-                pid,
-                "add runtime to overhead cgroup",
-            )?;
+            Self::place_proc_sync(overhead_cgroup, pid, "add runtime to overhead cgroup")?;
         } else {
-            Self::add_proc_with_existing_retry(
-                &mut sandbox_cgroup,
-                pid,
-                "add runtime to sandbox cgroup",
-            )?;
-            // The systemd add_proc above is asynchronous; make sure we have
-            // really joined the sandbox cgroup before forking any child.
-            Self::place_runtime_in_sandbox_cgroup_v2_sync(&sandbox_cgroup)
-                .context("synchronously place runtime in sandbox cgroup")?;
+            Self::place_proc_sync(&mut sandbox_cgroup, pid, "add runtime to sandbox cgroup")?;
         }
 
         Ok(Self {
@@ -254,6 +300,30 @@ impl CgroupsResourceInner {
         }
 
         Ok(hv_pids.vcpus.len())
+    }
+
+    /// Add the VMM process to the sandbox cgroup.
+    ///
+    /// Only needed when there is no overhead cgroup: in that case the VMM is
+    /// expected to be in the sandbox cgroup by inheritance from the runtime,
+    /// and nothing else ever moves it. Placing it explicitly means a VMM that
+    /// was forked before the runtime joined the sandbox cgroup does not stay
+    /// behind in the cgroup the shim was started in (e.g.
+    /// `system.slice/containerd.service`).
+    async fn move_vmm_to_sandbox_cgroup(&mut self, hypervisor: &dyn Hypervisor) -> Result<()> {
+        let tid = hypervisor
+            .get_vmm_master_tid()
+            .await
+            .context("get vmm master tid")?;
+        let tgid = get_tgid_from_pid(tid as i32).context("get tgid from vmm master tid")? as u32;
+
+        // Hypervisors running inside the runtime process (e.g. Dragonball)
+        // were already placed along with the runtime itself.
+        if tgid == process::id() {
+            return Ok(());
+        }
+
+        Self::place_proc_sync(&mut self.sandbox_cgroup, tgid, "add vmm to sandbox cgroup")
     }
 
     async fn update_sandbox_cgroups(&mut self, hypervisor: &dyn Hypervisor) -> Result<bool> {
@@ -500,6 +570,16 @@ impl CgroupsResourceInner {
     }
 
     pub(crate) async fn setup_after_start_vm(&mut self, hypervisor: &dyn Hypervisor) -> Result<()> {
+        // With an overhead cgroup the VMM lives there and only its vCPU
+        // threads are constrained by the sandbox cgroup, which
+        // `update_sandbox_cgroups` below takes care of. Without one, the
+        // whole VMM belongs to the sandbox cgroup.
+        if self.overhead_cgroup.is_none() {
+            self.move_vmm_to_sandbox_cgroup(hypervisor)
+                .await
+                .context("move vmm to sandbox cgroup")?;
+        }
+
         let updated = self
             .update_sandbox_cgroups(hypervisor)
             .await
